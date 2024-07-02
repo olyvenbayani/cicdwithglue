@@ -1,1 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  BucketName:
+    Type: String 
+  SourceBucket:
+    Type: String
+  ObjectKey:
+    Type: String
+    Default: script/lab9/source
+  EnvType:
+    Description: Environment type.
+    Default: test
+    Type: String
+    AllowedValues:
+    - prod
+    - test
+    ConstraintDescription: must specify prod or test.
+Resources:
+  binariesBucket:
+    Type: AWS::S3::Bucket
+    Properties: {}
+  unzipFiles:
+    Type: Custom::copyLambdaFiles
+    DependsOn:
+    - binariesBucket
+    Properties:
+      ServiceToken: !GetAtt [unzipFilesFunction, Arn]
 
+  unzipFilesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda function to prepare files
+      Environment:
+        Variables:
+          destinationbucket : !Ref 'binariesBucket'
+          sourcebucket: !Ref 'BucketName'
+          zipKey: !Ref 'ObjectKey'
+      Code:
+        ZipFile: |
+         import cfnresponse
+         import boto3
+         from botocore.client import Config
+         import zipfile
+         import os
+         def handler(event, context):
+            client = boto3.client('s3')
+            destinationbucket = os.environ['destinationbucket']
+            if event['RequestType'] != 'Delete':
+               print(event)
+               s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+               sourcebucket = os.environ['sourcebucket']
+               zipKey = os.environ['zipKey']
+               s3.download_file(sourcebucket, zipKey, '/tmp/target.zip')
+               zfile = zipfile.ZipFile('/tmp/target.zip', 'r')
+               zfile.extractall('/tmp/')
+               zfile.close()
+               s3.upload_file('/tmp/datalakejob.py', destinationbucket, 'gluescripts/datalakejob.py')
+            else:
+               s3 = boto3.resource('s3')
+               bucket = s3.Bucket(destinationbucket)
+               for key in bucket.objects.all():
+                  client.delete_object(Bucket=destinationbucket,  Key=key.key)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+      Handler: index.handler
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      Runtime: python3.9
+      Timeout: 300    
+
+  rawcrawler:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Role: !GetAtt crawlerrole.Arn
+      DatabaseName: !Join [ "_", [ "covid19" , !Ref "AWS::StackName"  ] ]
+      Targets: 
+        S3Targets:
+         - Path: !Join [ "/", [ "s3:/" , !Ref 'SourceBucket', input/lab9/us-states/ ] ]
+
+  datalakecrawler:
+    Type: "AWS::Glue::Crawler"
+    Properties:
+      Role: !GetAtt crawlerrole.Arn
+      DatabaseName: !Join [ "_", [ "covid19parquet" , !Ref "AWS::StackName"  ] ]
+      Targets: 
+        S3Targets:
+         - Path: !Join [ "/", [ "s3:/",!Ref 'binariesBucket' , datalake/us_states/ ] ]
+
+  crawlerrole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - glue.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3allsinglebucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - s3:GetObject
+              Resource: 
+              - !Join [ "", [ "arn:aws:s3:::", !Ref binariesBucket , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref SourceBucket , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref 'BucketName', "/*" ] ] 
+              Effect: Allow
+            - Action:
+              - s3:ListBucket
+              Resource: 
+              - !Join [ "", [ "arn:aws:s3:::",!Ref binariesBucket ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref SourceBucket ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref BucketName ] ]
+              Effect: Allow
+
+  etljob:
+    Type: "AWS::Glue::Job"
+    DependsOn: unzipFiles    
+    Properties:
+      Role: !Ref gluejobrole
+      AllocatedCapacity: 10
+      GlueVersion: "4.0"
+      DefaultArguments:
+        "--TempDir": !Join [ "/", [ "s3:/",!Ref 'binariesBucket' , tmp/ ] ]
+        "--sourcedatabase": !Join [ "_", [ "covid19" , !Ref "AWS::StackName"  ] ]
+        "--destinationpath": !Join [ "/", [ "s3:/",!Ref 'binariesBucket' , datalake/ ] ]
+        "--region": !Ref AWS::Region
+        "--job-bookmark-option": job-bookmark-enable
+      Command: 
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Join [ "/", [ "s3:/",!Ref 'binariesBucket' , gluescripts/datalakejob.py ] ]
+
+  gluejobrole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - glue.amazonaws.com
+            - lambda.amazonaws.com            
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: s3allsinglebucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Action:
+              - s3:*
+              Resource: 
+              - !Join [ "", [ "arn:aws:s3:::", !Ref binariesBucket , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref binariesBucket ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref SourceBucket , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref SourceBucket ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref 'BucketName', "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref BucketName ] ]                          
+              Effect: Allow
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 's3:*'
+            Resource: 
+              - !Join [ "", [ "arn:aws:s3:::", !Ref 'SourceBucket', "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref SourceBucket ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref 'BucketName', "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref BucketName ] ]
+              - !Join [ "", [ "arn:aws:s3:::", !Ref binariesBucket , "/*" ] ]
+              - !Join [ "", [ "arn:aws:s3:::",!Ref binariesBucket ] ]
